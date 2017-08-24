@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <iterator>
+#include <float.h>
 
 #include "particle_filter.h"
 
@@ -30,7 +31,7 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
     // Set number of particles
     num_particles = 25;
 
-    // Create normal distributions for x, y and theta initial poses
+    // Create normal distributions for x, y and theta initial poses based on accuracy of GPS measurement
     default_random_engine gen;
     normal_distribution<double> dist_x(x, std[0]);
     normal_distribution<double> dist_y(y, std[1]);
@@ -62,7 +63,7 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
 	//  http://en.cppreference.com/w/cpp/numeric/random/normal_distribution
 	//  http://www.cplusplus.com/reference/random/default_random_engine/
 
-    // Create noise model
+    // Create motion noise model
     default_random_engine gen;
     normal_distribution<double> dist_x(0, std_pos[0]);
     normal_distribution<double> dist_y(0, std_pos[1]);
@@ -70,7 +71,7 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
 
     for (int i = 0; i < num_particles; i++)
     {
-        // Update position based on model
+        // Update position based on motion model
         Particle & particle = particles[i];
         if (abs(yaw_rate) > 0)
         {
@@ -84,35 +85,38 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
             particle.y += velocity * delta_t * cos(particle.theta);
         }
         
-        // Add noise
-
+        // Add noise to particle state
         particle.x += dist_x(gen);
         particle.y += dist_y(gen);
         particle.theta += dist_theta(gen);
     }
 }
 
-void ParticleFilter::dataAssociation(std::vector<LandmarkObs> predicted, std::vector<LandmarkObs>& observations, double sensor_range) {
+void ParticleFilter::dataAssociation(std::vector<LandmarkObs> predicted, std::vector<LandmarkObs>& observations) {
 	// TODO: Find the predicted measurement that is closest to each observed measurement and assign the 
 	//   observed measurement to this particular landmark.
 	// NOTE: this method will NOT be called by the grading code. But you will probably find it useful to 
 	//   implement this method and use it as a helper during the updateWeights phase.
 
+    // For each observation...
     for (int i = 0; i < observations.size(); i++)
     {
         LandmarkObs & measurement = observations[i];
 
+        // Find the best predicted landmark observation to match against
         measurement.id = 0;
-        double bestAssociationDistance = sensor_range;
+        double bestAssociationError = DBL_MAX;
         for (int j = 0; j < predicted.size(); j++)
         {
             const LandmarkObs & prediction = predicted[j];
 
-            double distance = dist(measurement.x, measurement.y, prediction.x, prediction.y);
-            if (distance < bestAssociationDistance)
+            // Calculate error between measurement and prediction
+            double error = dist(measurement.x, measurement.y, prediction.x, prediction.y);
+            if (error < bestAssociationError)
             {
+                // This is the best association so far
                 measurement.id = prediction.id;
-                bestAssociationDistance = distance;
+                bestAssociationError = error;
             }
         }
     }
@@ -131,36 +135,41 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 	//   3.33
 	//   http://planning.cs.uiuc.edu/node99.html
 
+    // For each particle...
     for (int i = 0; i < num_particles; i++)
     {
         Particle & particle = particles[i];
 
-        // Calculate predicted measurement to each feature
+        // Calculate predicted measurement to each landmark
         std::vector<LandmarkObs> predictions;
         for (int k = 0; k < map_landmarks.landmark_list.size(); k++)
         {
             const Map::single_landmark_s & landmark = map_landmarks.landmark_list[k];
 
-            // Calculate offset to feature from particle
+            // Calculate offset to landmark from particle
             double dx = landmark.x_f - particle.x;
             double dy = landmark.y_f - particle.y;
 
-            // Convert into vehicle frame
-            double sense_x = dx * cos(particle.theta) + dy * sin(particle.theta);
-            double sense_y = -dx * sin(particle.theta) + dy * cos(particle.theta);
-                    
-            // Create prediction
-            LandmarkObs predicted;
-            predicted.id = landmark.id_i;
-            predicted.x = sense_x;
-            predicted.y = sense_y;
+            // Make sure landmark is within range of sensor
+            if (sqrt(dx*dx + dy*dy) < sensor_range)
+            {
+                // Convert into vehicle frame
+                double sense_x = dx * cos(particle.theta) + dy * sin(particle.theta);
+                double sense_y = -dx * sin(particle.theta) + dy * cos(particle.theta);
 
-            // Add to list
-            predictions.push_back(predicted);
+                // Create predicted measurement
+                LandmarkObs predicted;
+                predicted.id = landmark.id_i;
+                predicted.x = sense_x;
+                predicted.y = sense_y;
+
+                // Add to list of predicted measurements
+                predictions.push_back(predicted);
+            }
         }
 
         // Associate measurements based on predicted measurements
-        dataAssociation(predictions, observations, sensor_range);
+        dataAssociation(predictions, observations);
 
         // Calculate new particle weight and associations
         std::vector<int> associations;
@@ -178,13 +187,16 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 
                 if (prediction.id == measurement.id)
                 {
+                    // Calculate weight adjustment for this association
                     double dx = measurement.x - prediction.x;
                     double dy = measurement.y - prediction.y;
-                    double w_j = exp(-0.5 * (dx * dx / (std_landmark[0] * std_landmark[0]) + dy * dy / (std_landmark[1] * std_landmark[1]))) /
-                        sqrt(2 * M_PI * std_landmark[0] * std_landmark[1]);
+                    double sig_x2 = std_landmark[0] * std_landmark[0];
+                    double sig_y2 = std_landmark[1] * std_landmark[1];
+                    double w_j = exp(-0.5 * (dx * dx / sig_x2 + dy * dy / sig_y2)) / sqrt(2 * M_PI * sig_x2 * sig_y2);
 
                     weight *= w_j;
 
+                    // Transform measurement back into map coordinate frame and add to list of associations/sensor measurements
                     associations.push_back(measurement.id);
                     sense_x.push_back(particle.x + measurement.x * cos(-particle.theta) + measurement.y * sin(-particle.theta));
                     sense_y.push_back(particle.y - measurement.x * sin(-particle.theta) + measurement.y * cos(-particle.theta));
@@ -194,6 +206,7 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
             }
         }
 
+        // Set new particle weight
         particle.weight = weight;
         weights[i] = particle.weight;
 
@@ -210,13 +223,14 @@ void ParticleFilter::resample() {
     default_random_engine gen;
     discrete_distribution<int> distribution(weights.begin(), weights.end());
 
+    // Sample new particles
     std::vector<Particle> new_particles;
-
     for (int i = 0; i < num_particles; i++)
     {
         new_particles.push_back(particles[distribution(gen)]);
     }
 
+    // Assign to particles list
     particles = new_particles;
 }
 
